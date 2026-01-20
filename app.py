@@ -1,110 +1,147 @@
+import streamlit as st
 import pandas as pd
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import io
 
-app = Flask(__name__)
-CORS(app)
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="Yoco Input Verifier", page_icon="✅", layout="wide")
 
-def validate_yoco_sheet(file_stream):
-    report = {"status": "success", "issues": []}
+st.title("✅ Yoco Data Verification Tool")
+st.markdown("""
+This tool checks your **Yoco Input Sheet** for common errors before you submit it.
+**Checks performed:**
+- Missing required fields (Site Info, Owner details)
+- Invalid Employee PINs (must be numbers, often 4 digits)
+- Missing Cost Prices
+- **Ghost Inventory:** Recipes using ingredients that don't exist in Stock Items
+""")
+
+# --- UPLOAD SECTION ---
+uploaded_file = st.file_uploader("Upload your Excel file (.xlsx)", type=["xlsx"])
+
+def clean_yoco_header(df, col_name):
+    """Helper to find the real header row if it's not row 0"""
+    # If the specific column isn't in the first row, look deeper
+    if col_name not in df.columns:
+        # Try finding the row index where the column exists
+        for i, row in df.iterrows():
+            if row.astype(str).str.contains(col_name).any():
+                # Reload dataframe with this row as header
+                new_df = pd.read_excel(uploaded_file, sheet_name=df.name, header=i+1)
+                return new_df
+    return df
+
+if uploaded_file:
+    xls = pd.ExcelFile(uploaded_file)
     
-    # Load the Excel file (all sheets)
-    try:
-        xls = pd.ExcelFile(file_stream)
-    except Exception as e:
-        return {"status": "error", "message": f"Could not read Excel file: {str(e)}"}
+    # Create tabs for the report
+    tab1, tab2, tab3 = st.tabs(["🔴 Critical Errors", "⚠️ Warnings", "📋 Data Summary"])
+    
+    critical_errors = []
+    warnings = []
+    summary_data = []
 
-    # --- TAB 1: Site Data Information ---
+    # --- 1. SITE INFO CHECK ---
     if "Site Data Information" in xls.sheet_names:
-        df = pd.read_excel(xls, "Site Data Information", header=0)
-        # Remove example row if it exists
-        df = df[df["Site Name"] != "EXAMPLE"]
+        df_site = pd.read_excel(uploaded_file, "Site Data Information")
+        # Filter out example row
+        df_site = df_site[df_site.iloc[:, 0] != "EXAMPLE"]
         
-        required_cols = ["Site Name", "Owner Email Address", "Owner Telephone Number"]
-        for col in required_cols:
-            if col in df.columns and df[col].isnull().any():
-                report["issues"].append(f"⚠️ 'Site Data Information': Missing values in '{col}'.")
+        req_cols = ["Site Name", "Owner Email Address", "Owner Telephone Number"]
+        for col in req_cols:
+            if col in df_site.columns and df_site[col].isnull().any():
+                critical_errors.append(f"**Site Data:** Missing required value in column `{col}`")
+        
+        if not df_site.empty:
+            summary_data.append(f"Site Name: **{df_site.iloc[0].get('Site Name', 'Unknown')}**")
 
-    # --- TAB 2: Employee List ---
+    # --- 2. EMPLOYEE CHECK ---
     if "Employee List" in xls.sheet_names:
-        df = pd.read_excel(xls, "Employee List", header=0)
-        df = df[df["Employee Name"] != "EXAMPLE"] # Filter example
+        df_emp = pd.read_excel(uploaded_file, "Employee List")
+        df_emp = df_emp[df_emp.iloc[:, 0] != "EXAMPLE"]
         
-        if "Login Code" in df.columns:
-            # Check for non-numeric PINs
-            non_numeric = df[pd.to_numeric(df["Login Code"], errors='coerce').isna()]
-            if not non_numeric.empty:
-                 report["issues"].append(f"❌ 'Employee List': Found {len(non_numeric)} Login Codes that are not numbers.")
-            
-            # Check length (should be 4 digits usually, strictly speaking)
-            # This converts to string and checks length
-            short_pins = df[df["Login Code"].astype(str).apply(lambda x: len(x.split('.')[0])) < 4]
+        if "Login Code" in df_emp.columns:
+            # Check for non-numeric
+            non_nums = df_emp[pd.to_numeric(df_emp["Login Code"], errors='coerce').isna()]
+            for _, row in non_nums.iterrows():
+                critical_errors.append(f"**Employee List:** Login Code for `{row['Employee Name']}` is not a number.")
+
+            # Check for short PINs (Safety check)
+            short_pins = df_emp[df_emp["Login Code"].astype(str).str.len() < 4]
             if not short_pins.empty:
-                report["issues"].append(f"⚠️ 'Employee List': Some Login Codes might be too short (less than 4 digits).")
+                warnings.append(f"**Employee List:** {len(short_pins)} employees have PINs shorter than 4 digits.")
 
-    # --- TAB 3: Products (Finished Goods) ---
+    # --- 3. PRODUCTS & PRICES CHECK ---
     if "Products(Finished Goods)" in xls.sheet_names:
-        df = pd.read_excel(xls, "Products(Finished Goods)", header=0)
-        df = df[df["Product Name & Variant"] != "EXAMPLE"]
+        df_prod = pd.read_excel(uploaded_file, "Products(Finished Goods)")
+        df_prod = df_prod[df_prod.iloc[:, 0] != "EXAMPLE"]
         
-        # Check Selling Price
-        if "Selling Price (incl vat)" in df.columns:
-            invalid_prices = df[pd.to_numeric(df["Selling Price (incl vat)"], errors='coerce').isna()]
-            if not invalid_prices.empty:
-                report["issues"].append(f"❌ 'Products': Found {len(invalid_prices)} products with invalid selling prices.")
+        if "Selling Price (incl vat)" in df_prod.columns:
+            missing_price = df_prod[pd.to_numeric(df_prod["Selling Price (incl vat)"], errors='coerce').isna()]
+            if not missing_price.empty:
+                critical_errors.append(f"**Products:** Found {len(missing_price)} products with invalid or missing selling prices.")
+        
+        summary_data.append(f"Total Products to Import: **{len(df_prod)}**")
 
-    # --- TAB 4: Stock Items (RAW MATERIALS) ---
-    # This sheet often has a header instruction on the first row
-    if "Stock Items(RAW MATERIALS)" in xls.sheet_names:
-        # We try to find the real header. Usually it's row 1 (index 1) if row 0 is instructions
-        df = pd.read_excel(xls, "Stock Items(RAW MATERIALS)")
-        
-        # Determine actual header row by searching for specific column name
-        if "RAW MATERIAL Product Name" not in df.columns:
-            df = pd.read_excel(xls, "Stock Items(RAW MATERIALS)", header=1)
-        
-        df = df[df["RAW MATERIAL Product Name"] != "EXAMPLES"]
-        
-        # Check for Cost Price
-        if "Cost Price " in df.columns:
-            missing_cost = df[df["Cost Price "].isnull()]
-            if not missing_cost.empty:
-                report["issues"].append(f"⚠️ 'Stock Items': Found {len(missing_cost)} items with missing Cost Price.")
-
-    # --- CROSS REFERENCE: Recipes (Advanced) ---
-    # Check if ingredients in recipes actually exist in the Stock Items tab
+    # --- 4. RECIPE VS STOCK CHECK (The Complex One) ---
     if "Products Recipes" in xls.sheet_names and "Stock Items(RAW MATERIALS)" in xls.sheet_names:
-        recipes = pd.read_excel(xls, "Products Recipes", header=4) # Headers often lower down on recipe sheets
-        stock = pd.read_excel(xls, "Stock Items(RAW MATERIALS)", header=1)
+        # Load Stock (Handling the weird header rows Yoco sometimes has)
+        df_stock = pd.read_excel(uploaded_file, "Stock Items(RAW MATERIALS)", header=None)
         
-        # Clean data
-        stock_list = stock["RAW MATERIAL Product Name"].dropna().astype(str).str.strip().unique()
+        # Simple search for the row containing "RAW MATERIAL Product Name"
+        header_row_idx = 0
+        for i, row in df_stock.iterrows():
+            if row.astype(str).str.contains("RAW MATERIAL Product Name").any():
+                header_row_idx = i
+                break
         
-        if "RAW MATERIALS / MANUFACTURED PRODUCT NAME" in recipes.columns:
-            recipe_ingredients = recipes["RAW MATERIALS / MANUFACTURED PRODUCT NAME"].dropna().astype(str).str.strip().unique()
+        # Reload with correct header
+        df_stock = pd.read_excel(uploaded_file, "Stock Items(RAW MATERIALS)", header=header_row_idx)
+        df_stock = df_stock[df_stock["RAW MATERIAL Product Name"] != "EXAMPLES"]
+        stock_list = set(df_stock["RAW MATERIAL Product Name"].dropna().astype(str).str.strip())
+
+        # Load Recipes
+        df_recipes = pd.read_excel(uploaded_file, "Products Recipes", header=None)
+        # Find recipe header
+        rec_header_idx = 0
+        for i, row in df_recipes.iterrows():
+            if row.astype(str).str.contains("RAW MATERIALS / MANUFACTURED PRODUCT NAME").any():
+                rec_header_idx = i
+                break
+        
+        df_recipes = pd.read_excel(uploaded_file, "Products Recipes", header=rec_header_idx)
+        df_recipes = df_recipes[df_recipes.iloc[:, 0] != "EXAMPLE"]
+
+        if "RAW MATERIALS / MANUFACTURED PRODUCT NAME" in df_recipes.columns:
+            ingredients = df_recipes["RAW MATERIALS / MANUFACTURED PRODUCT NAME"].dropna().astype(str).str.strip().unique()
             
-            # Find missing
-            missing = [item for item in recipe_ingredients if item not in stock_list and item != "EXAMPLE"]
-            if missing:
-                # Limit list to first 5 to save space
-                report["issues"].append(f"❌ 'Products Recipes': These ingredients are used but not found in Stock Items list: {', '.join(missing[:5])}...")
+            missing_ingredients = [ing for ing in ingredients if ing not in stock_list and ing != "EXAMPLE"]
+            
+            if missing_ingredients:
+                critical_errors.append(f"**Recipes:** The following ingredients are used in recipes but NOT found in Stock Items list (Ghost Inventory):")
+                for m in missing_ingredients:
+                    critical_errors.append(f"- `{m}`")
 
-    if not report["issues"]:
-        report["message"] = "✅ No critical data issues found. File looks good!"
-    else:
-        report["message"] = "⚠️ Found data issues. See list below."
+    # --- DISPLAY RESULTS ---
+    with tab1:
+        if critical_errors:
+            st.error(f"Found {len(critical_errors)} Critical Issues")
+            for err in critical_errors:
+                st.write(f"❌ {err}")
+        else:
+            st.success("No critical errors found!")
 
-    return report
+    with tab2:
+        if warnings:
+            st.warning(f"Found {len(warnings)} Warnings")
+            for warn in warnings:
+                st.write(f"⚠️ {warn}")
+        else:
+            st.info("No warnings.")
 
-@app.route('/verify', methods=['POST'])
-def verify_excel():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-    
-    file = request.files['file']
-    result = validate_yoco_sheet(file)
-    return jsonify(result)
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    with tab3:
+        st.write("### File Summary")
+        for line in summary_data:
+            st.markdown(f"- {line}")
+        
+        if st.checkbox("Show Raw Data Preview"):
+            st.dataframe(pd.read_excel(uploaded_file, sheet_name=0).head())
