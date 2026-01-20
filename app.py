@@ -9,12 +9,7 @@ st.set_page_config(page_title="Yoco Onboarding Verifier", page_icon="🛡️", l
 st.markdown("""
 <style>
     .stDataFrame { border: 1px solid #ddd; border-radius: 5px; }
-    .score-card { 
-        padding: 20px; 
-        border-radius: 10px; 
-        text-align: center; 
-        border: 2px solid #eee;
-    }
+    .score-card { padding: 20px; border-radius: 10px; text-align: center; border: 2px solid #eee; }
     .good { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
     .average { background-color: #fff3cd; color: #856404; border-color: #ffeeba; }
     .bad { background-color: #f8d7da; color: #721c24; border-color: #f5c6cb; }
@@ -24,8 +19,7 @@ st.markdown("""
 # --- HELPER: GET VISIBLE SHEETS ONLY ---
 def get_visible_sheet_names(file):
     """
-    Uses openpyxl to check which sheets are actually visible.
-    Returns a list of visible sheet names.
+    Strictly filters out hidden sheets.
     """
     try:
         wb = openpyxl.load_workbook(file, read_only=True)
@@ -35,67 +29,85 @@ def get_visible_sheet_names(file):
                 visible_sheets.append(sheet.title)
         return visible_sheets
     except Exception as e:
+        st.error(f"Error reading workbook structure: {e}")
         return []
 
-# --- HELPER: CLEAN DATA LOADER ---
+# --- HELPER: INTELLIGENT DATA PARSER (The Fix) ---
 def get_clean_data(file, sheet_name, unique_col_identifier):
     """
-    1. Finds the true header row (scans first 20 rows).
-    2. Strips whitespace from column names (Fixes KeyError).
-    3. Finds the last 'EXAMPLE' row and slices data below it.
+    1. Scans the first 50 rows.
+    2. Finds ALL rows that contain the 'unique_col_identifier'.
+    3. Selects the LAST occurrence as the Header (Skipping top examples).
+    4. Strips whitespace and ignores blank 'template' rows.
     """
     try:
-        # Step A: Find the Header Row
-        df_scan = pd.read_excel(file, sheet_name=sheet_name, header=None, nrows=20)
+        # Step A: Deep Scan (Read 50 rows to find the second header)
+        df_scan = pd.read_excel(file, sheet_name=sheet_name, header=None, nrows=50)
         
-        header_row_idx = None
+        matching_rows = []
+        
         for i, row in df_scan.iterrows():
+            # Clean row string: remove extra spaces, case insensitive
             row_str = row.astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
+            
+            # Check if this row looks like a header
             if row_str.str.contains(unique_col_identifier, case=False, na=False).any():
-                header_row_idx = i
-                break
+                matching_rows.append(i)
         
-        if header_row_idx is None:
-            return None, f"Could not find header containing '{unique_col_identifier}'"
+        if not matching_rows:
+            return None, f"Could not find header '{unique_col_identifier}'"
 
-        # Step B: Load data with the correct header
+        # --- THE LOGIC FIX: PICK THE LAST HEADER FOUND ---
+        # If headers are on Row 5 and Row 15, we pick 15.
+        header_row_idx = matching_rows[-1]
+
+        # Step B: Load data starting from the correct header
         df = pd.read_excel(file, sheet_name=sheet_name, header=header_row_idx)
         
-        # Strip whitespace from columns
+        # Strip whitespace from column names (Fixes "Price " vs "Price")
         df.columns = df.columns.astype(str).str.strip()
 
-        # Step C: Find the last "EXAMPLE" row
-        last_example_idx = -1
-        for i in range(min(15, len(df))):
-            row_values = df.iloc[i].astype(str).str.upper()
-            if row_values.str.contains("EXAMPLE").any():
-                last_example_idx = i
+        # Step C: Identity Check (Remove blank template rows)
+        # We look for the column that matched our identifier
+        # (e.g. "Product Name") and ensure it's not empty.
         
-        # Step D: Slice the data
-        client_data = df.iloc[last_example_idx+1:].copy()
+        # Find the actual column name in the new df that matches our search term
+        target_col = next((c for c in df.columns if unique_col_identifier.lower() in c.lower()), None)
         
+        if target_col:
+            # Filter: Keep row only if the Name column is not empty/nan
+            df = df[df[target_col].notna()]
+            df = df[df[target_col].astype(str).str.strip() != ""]
+            
+            # Double check we didn't accidentally pick up an "EXAMPLE" row
+            # (In case the header was the very first one and examples followed)
+            df = df[df[target_col].astype(str).str.upper() != "EXAMPLE"]
+
         # Helper column for user reference
         offset = header_row_idx + 2 
-        client_data['__excel_row__'] = client_data.index + offset
+        df['__excel_row__'] = df.index + offset
         
-        return client_data, None
+        return df, None
 
     except Exception as e:
         return None, str(e)
 
 # --- MAIN APP ---
-st.title("🛡️ Yoco Sheet Verifier")
-st.markdown("Upload your Excel sheet. The tool intelligently ignores hidden sheets, examples, and empty template rows.")
+st.title("🛡️ Yoco Sheet Verifier (v3)")
+st.markdown("Logic Update: **Hidden Sheets** are ignored. **Examples** are skipped (Data must be below the second header).")
 
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
 if uploaded_file:
-    # 1. Identify Visible Sheets
+    # 1. Identify Visible Sheets Only
     visible_sheets = get_visible_sheet_names(uploaded_file)
-    if not visible_sheets:
-        st.error("Could not read workbook. Are all sheets hidden?")
-        st.stop()
     
+    if not visible_sheets:
+        st.error("No visible sheets found in this Excel file.")
+        st.stop()
+        
+    st.caption(f"Analyzing Visible Sheets: {', '.join(visible_sheets)}")
+
     # 2. Init Scoring & Logs
     quality_score = 100
     error_log = []
@@ -110,19 +122,13 @@ if uploaded_file:
         df_stock, err = get_clean_data(uploaded_file, "Stock Items(RAW MATERIALS)", "RAW MATERIAL Product Name")
         
         if df_stock is not None:
-            # Populate Source of Truth
+            # Source of Truth
             stock_items_set = set(df_stock["RAW MATERIAL Product Name"].dropna().astype(str).str.strip())
             
             if "Cost Price" in df_stock.columns:
                 for _, row in df_stock.iterrows():
-                    # --- IDENTITY CHECK ---
-                    # If the Item Name is missing, skip the row (it's a blank/template row)
-                    item_name = str(row["RAW MATERIAL Product Name"]).strip()
-                    if item_name == "nan" or item_name == "":
-                        continue
-
-                    # Now validate data
                     val = row["Cost Price"]
+                    # If price is missing (and row wasn't skipped by our Identity Check)
                     if pd.isna(val) or str(val).strip() == "":
                         quality_score -= PENALTY_CRITICAL
                         error_log.append({
@@ -142,11 +148,6 @@ if uploaded_file:
         
         if df_emp is not None and "Login Code" in df_emp.columns:
             for _, row in df_emp.iterrows():
-                # --- IDENTITY CHECK ---
-                emp_name = str(row["Employee Name"]).strip()
-                if emp_name == "nan" or emp_name == "":
-                    continue # Skip empty row
-
                 code = str(row["Login Code"]).strip()
                 if code.endswith(".0"): code = code[:-2]
                 
@@ -175,65 +176,54 @@ if uploaded_file:
     # CHECK 3: PRODUCTS
     # ==========================================
     if "Products(Finished Goods)" in visible_sheets:
-        # Note: We look for 'Product Name' or 'Product Name & Variant'
         df_prod, err = get_clean_data(uploaded_file, "Products(Finished Goods)", "Product Name")
         
-        if df_prod is not None:
-            # Find the exact column name for Product Name
-            prod_name_col = next((c for c in df_prod.columns if "Product Name" in c), None)
-            
-            if prod_name_col and "Selling Price (incl vat)" in df_prod.columns:
-                for _, row in df_prod.iterrows():
-                    # --- IDENTITY CHECK ---
-                    # Ignore row if Product Name is empty, even if "ea(Each)" exists
-                    p_name = str(row[prod_name_col]).strip()
-                    if p_name == "nan" or p_name == "":
-                        continue 
-
-                    price = row["Selling Price (incl vat)"]
-                    
-                    if pd.isna(price):
-                        quality_score -= PENALTY_CRITICAL
-                        error_log.append({
-                            "Severity": "Critical",
-                            "Sheet": "Products",
-                            "Row": row['__excel_row__'],
-                            "Column": "Selling Price",
-                            "Issue": "Missing Price",
-                            "Fix": "Enter a numeric value"
-                        })
-                    elif isinstance(price, str) and not price.replace('.','',1).isdigit():
-                        quality_score -= PENALTY_CRITICAL
-                        error_log.append({
-                            "Severity": "Critical",
-                            "Sheet": "Products",
-                            "Row": row['__excel_row__'],
-                            "Column": "Selling Price",
-                            "Issue": f"Invalid format '{price}'",
-                            "Fix": "Remove 'R' or spaces. Use numbers only."
-                        })
+        if df_prod is not None and "Selling Price (incl vat)" in df_prod.columns:
+            for _, row in df_prod.iterrows():
+                price = row["Selling Price (incl vat)"]
+                
+                if pd.isna(price):
+                    quality_score -= PENALTY_CRITICAL
+                    error_log.append({
+                        "Severity": "Critical",
+                        "Sheet": "Products",
+                        "Row": row['__excel_row__'],
+                        "Column": "Selling Price",
+                        "Issue": "Missing Price",
+                        "Fix": "Enter a numeric value"
+                    })
+                elif isinstance(price, str) and not price.replace('.','',1).isdigit():
+                    quality_score -= PENALTY_CRITICAL
+                    error_log.append({
+                        "Severity": "Critical",
+                        "Sheet": "Products",
+                        "Row": row['__excel_row__'],
+                        "Column": "Selling Price",
+                        "Issue": f"Invalid format '{price}'",
+                        "Fix": "Remove 'R' or spaces."
+                    })
 
     # ==========================================
-    # CHECK 4: RECIPES
+    # CHECK 4: RECIPES (The Tricky One)
     # ==========================================
     if "Products Recipes" in visible_sheets:
         df_rec, err = get_clean_data(uploaded_file, "Products Recipes", "RAW MATERIALS")
         
+        # Handle Column Name Variations
         col_ing_name = "RAW MATERIALS / MANUFACTURED PRODUCT NAME"
         
         if df_rec is not None:
-            # Fallback for column name mismatch
             if col_ing_name not in df_rec.columns:
+                # Try finding a partial match
                 candidates = [c for c in df_rec.columns if "RAW MATERIAL" in c.upper() and "NAME" in c.upper()]
                 if candidates: col_ing_name = candidates[0]
 
             if col_ing_name in df_rec.columns and stock_items_set:
                 for _, row in df_rec.iterrows():
-                    # --- IDENTITY CHECK ---
                     ing = str(row[col_ing_name]).strip()
-                    if ing == "nan" or ing == "": 
-                        continue # Skip empty row
-
+                    
+                    if ing == "nan" or ing == "": continue
+                    
                     if ing not in stock_items_set:
                         quality_score -= PENALTY_CRITICAL
                         error_log.append({
@@ -271,7 +261,7 @@ if uploaded_file:
     st.divider()
 
     if error_log:
-        st.subheader("🛠️ Action Plan: Fix these items")
+        st.subheader("🛠️ Action Plan")
         df_err = pd.DataFrame(error_log)
         
         st.dataframe(
