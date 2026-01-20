@@ -4,12 +4,18 @@ import openpyxl
 import re
 import io
 import time
-from rapidfuzz import process, fuzz # Requires: pip install rapidfuzz
+
+# --- IMPORT RAPIDFUZZ (With fallback if missing) ---
+try:
+    from rapidfuzz import process, fuzz
+    FUZZY_AVAILABLE = True
+except ImportError:
+    FUZZY_AVAILABLE = False
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Yoco Repair Station Pro",
-    page_icon="🛠️",
+    page_title="Yoco Data Doctor",
+    page_icon="🏥",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -19,8 +25,9 @@ st.markdown("""
 <style>
     .stApp { background-color: #f8f9fa; }
     .hero-box {
-        background: linear-gradient(90deg, #4b6cb7 0%, #182848 100%);
+        background: linear-gradient(90deg, #1cb5e0 0%, #000851 100%);
         padding: 30px; border-radius: 15px; color: white; text-align: center; margin-bottom: 20px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
     }
     .metric-card {
         background-color: white; padding: 20px; border-radius: 10px;
@@ -50,6 +57,7 @@ def normalize_name(name):
 
 def get_clean_data(file, sheet_name, unique_col_identifier):
     try:
+        # Deep Scan to find the header row
         df_scan = pd.read_excel(file, sheet_name=sheet_name, header=None, nrows=50)
         matching_rows = []
         for i, row in df_scan.iterrows():
@@ -59,15 +67,18 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
         
         if not matching_rows: return None, f"Header '{unique_col_identifier}' not found"
 
+        # USE THE LAST HEADER FOUND (Skips examples)
         header_row_idx = matching_rows[-1]
         df = pd.read_excel(file, sheet_name=sheet_name, header=header_row_idx)
         df.columns = df.columns.astype(str).str.strip()
 
+        # REMOVE EMPTY ROWS & EXAMPLES
         target_col = next((c for c in df.columns if unique_col_identifier.lower() in c.lower()), None)
         if target_col:
             df = df[df[target_col].notna()]
             df = df[df[target_col].astype(str).str.strip() != ""]
             df = df[df[target_col].astype(str).str.upper() != "EXAMPLE"]
+            df = df[df[target_col].astype(str).str.upper() != "EXAMPLES"]
 
         offset = header_row_idx + 2 
         df['Row #'] = df.index + offset
@@ -82,39 +93,33 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
 # --- 4. AUTO-FIX ENGINE ---
 def generate_autofixed_file(original_file, bad_data_tables):
     """
-    Opens original file and applies the '✨ SUGGESTED FIX' values to the cells.
+    Opens original file and applies the '✨ SUGGESTED FIX' values.
     """
     wb = openpyxl.load_workbook(original_file)
     
-    # Map Sheet Names to DataFrames
     for sheet_name, df_errors in bad_data_tables.items():
         if sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             
-            # Find column headers map
+            # Find column headers map (Row 1-20 scan)
             col_map = {}
             for r in range(1, 20):
                 for c in range(1, ws.max_column + 1):
                     val = ws.cell(row=r, column=c).value
                     if val: col_map[str(val).strip()] = c
             
-            # Iterate errors and apply fixes
             for idx, row in df_errors.iterrows():
                 excel_row = row['Row #']
                 suggestion = row['✨ SUGGESTED FIX']
-                
-                # We store the target column name in a hidden way or infer it
-                # For this demo, we infer based on the error message (simple parsing)
                 action = row['🔴 ACTION REQUIRED']
+                
+                if not suggestion or suggestion == "": continue
                 
                 target_col_idx = None
                 
-                # Logic to find which column to update based on the error
+                # Intelligent Column Mapping based on Error
                 if "Ghost Item" in action:
-                    # It's an ingredient column. We assume "RAW MATERIALS..."
-                    # In a full app, we'd pass the column name explicitly.
-                    # Fallback search for ingredient column:
-                    for k, v in col_map.items():
+                    for k, v in col_map.items(): 
                         if "RAW MATERIAL" in k.upper(): target_col_idx = v; break
                 elif "Price" in action:
                     for k, v in col_map.items(): 
@@ -122,11 +127,21 @@ def generate_autofixed_file(original_file, bad_data_tables):
                 elif "PIN" in action:
                     for k, v in col_map.items():
                         if "Login" in k: target_col_idx = v; break
-                
-                # Apply Fix if we have a target and a suggestion
-                if target_col_idx and suggestion and suggestion != "":
+                elif "Title Case" in action:
+                     # Find which column needs casing (Product Name, Menu, or Category)
+                     if "Category" in action:
+                         for k, v in col_map.items(): 
+                            if "Category" in k: target_col_idx = v; break
+                     elif "Menu" in action:
+                         for k, v in col_map.items(): 
+                            if "Menu" in k and "Category" not in k: target_col_idx = v; break
+                     else:
+                         for k, v in col_map.items(): 
+                            if "Product Name" in k: target_col_idx = v; break
+
+                if target_col_idx:
                     try:
-                        # Convert numeric strings back to numbers
+                        # Convert numbers back to float/int
                         if str(suggestion).replace('.','',1).isdigit():
                             ws.cell(row=int(excel_row), column=target_col_idx).value = float(suggestion)
                         else:
@@ -141,10 +156,13 @@ def generate_autofixed_file(original_file, bad_data_tables):
 # --- 5. MAIN APP ---
 st.markdown("""
 <div class="hero-box">
-    <h1>🛠️ Yoco Data Doctor</h1>
-    <p>Detects errors and offers <b>Auto-Fix Suggestions</b> for prices, spelling, and missing data.</p>
+    <h1>🏥 Yoco Data Doctor</h1>
+    <p>Ensures <b>Menus</b>, <b>Categories</b>, and <b>Prep Locations</b> are set correctly.</p>
 </div>
 """, unsafe_allow_html=True)
+
+if not FUZZY_AVAILABLE:
+    st.warning("⚠️ 'rapidfuzz' library not installed. Ghost Item matching will be less smart. Add it to requirements.txt.")
 
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
@@ -164,7 +182,7 @@ if uploaded_file:
     valid_ingredients = set()
     bad_data_tables = {}
     
-    with st.spinner("Diagnosing data health..."):
+    with st.spinner("🏥 Examining your data..."):
         
         # --- A. BUILD INGREDIENT LIST ---
         if "Stock Items(RAW MATERIALS)" in visible_sheets:
@@ -179,33 +197,67 @@ if uploaded_file:
                 for n in df["MANUFACTURED Product Name"].dropna().astype(str): 
                     valid_ingredients.add(normalize_name(n))
 
-        # --- B. CHECK PRODUCTS (Formatting & Pricing) ---
+        # --- B. CHECK PRODUCTS (POS VISIBILITY CHECK) ---
         if "Products(Finished Goods)" in visible_sheets:
             df_prod, _ = get_clean_data(uploaded_file, "Products(Finished Goods)", "Product Name")
             if df_prod is not None:
+                
+                # 1. Find the critical columns (Fuzzy find in case of slight naming changes)
+                cols = df_prod.columns
+                col_price = next((c for c in cols if "Selling Price" in c), None)
+                col_menu = next((c for c in cols if "Menu" in c and "Category" not in c), None)
+                col_cat = next((c for c in cols if "Category" in c), None)
+                col_prep = next((c for c in cols if "Preparation" in c or "Prep" in c), None)
+                col_name = next((c for c in cols if "Product Name" in c), None)
+
                 for i, row in df_prod.iterrows():
                     issues = []
                     suggestion = ""
                     
-                    # 1. Price Format Check
-                    price = row.get("Selling Price (incl vat)")
-                    if pd.notna(price):
-                        # Regex to check if it has non-numeric chars
-                        if re.search(r'[a-zA-Z\s]', str(price)):
-                            issues.append(f"Bad Format: '{price}'")
-                            # FIX: Strip everything except numbers and dots
-                            suggestion = re.sub(r'[^0-9.]', '', str(price))
+                    # CHECK 1: PRICE
+                    if col_price:
+                        price = row.get(col_price)
+                        if pd.isna(price) or str(price).strip() == "":
+                             issues.append("Missing Price")
+                        elif re.search(r'[a-zA-Z\s]', str(price)):
+                             issues.append(f"Bad Price Format")
+                             suggestion = re.sub(r'[^0-9.]', '', str(price))
+
+                    # CHECK 2: MENU (Food vs Drinks)
+                    if col_menu:
+                        val = row.get(col_menu)
+                        if pd.isna(val) or str(val).strip() == "":
+                            issues.append("Missing Menu (Hidden on POS)")
+                        elif str(val).islower():
+                            issues.append("Menu needs Title Case")
+                            suggestion = str(val).title()
+
+                    # CHECK 3: CATEGORY (Starters/Mains)
+                    if col_cat:
+                        val = row.get(col_cat)
+                        if pd.isna(val) or str(val).strip() == "":
+                            issues.append("Missing Category (Hidden on POS)")
+                        elif str(val).islower():
+                            issues.append("Category needs Title Case")
+                            suggestion = str(val).title()
+
+                    # CHECK 4: PREP LOCATION (Kitchen/Bar)
+                    if col_prep:
+                        val = row.get(col_prep)
+                        if pd.isna(val) or str(val).strip() == "":
+                            issues.append("Missing Prep Location (Wont Print)")
                     
-                    # 2. Casing Check (e.g. "coke")
-                    name = str(row.get("Product Name", ""))
-                    if name.islower():
-                        issues.append("Lowercase Name")
-                        suggestion = name.title() # Auto-Fix to Title Case
-                    
+                    # CHECK 5: PRODUCT NAME CASING
+                    if col_name:
+                         name = str(row.get(col_name))
+                         if name.islower():
+                             issues.append("Name is lowercase")
+                             suggestion = name.title()
+
                     if issues:
-                        df_prod.at[i, '🔴 ACTION REQUIRED'] = ", ".join(issues)
-                        df_prod.at[i, '✨ SUGGESTED FIX'] = suggestion
-                        quality_score -= 5
+                        df_prod.at[i, '🔴 ACTION REQUIRED'] = " & ".join(issues)
+                        if suggestion: df_prod.at[i, '✨ SUGGESTED FIX'] = suggestion
+                        quality_score -= 10
                 
                 bad = df_prod[df_prod['🔴 ACTION REQUIRED'] != ""]
                 if not bad.empty: bad_data_tables["Products"] = bad
@@ -214,22 +266,20 @@ if uploaded_file:
         if "Products Recipes" in visible_sheets:
             df_rec, _ = get_clean_data(uploaded_file, "Products Recipes", "RAW MATERIALS")
             if df_rec is not None:
-                # Find Ingredient Column
                 col_ing = next((c for c in df_rec.columns if "RAW MATERIAL" in c.upper() and "NAME" in c.upper()), None)
                 
                 if col_ing:
                     for i, row in df_rec.iterrows():
                         ing = normalize_name(row[col_ing])
                         if ing and ing not in valid_ingredients:
-                            # FUZZY MATCH LOGIC
-                            match = process.extractOne(ing, valid_ingredients, scorer=fuzz.WRatio)
                             suggestion = ""
                             issue_text = f"Ghost Item: '{row[col_ing]}'"
                             
-                            # If > 85% match confidence
-                            if match and match[1] > 85:
-                                suggestion = match[0]
-                                issue_text += " (Typo?)"
+                            if FUZZY_AVAILABLE:
+                                match = process.extractOne(ing, valid_ingredients, scorer=fuzz.WRatio)
+                                if match and match[1] > 85:
+                                    suggestion = match[0]
+                                    issue_text += " (Typo?)"
                             
                             df_rec.at[i, '🔴 ACTION REQUIRED'] = issue_text
                             df_rec.at[i, '✨ SUGGESTED FIX'] = suggestion
@@ -246,7 +296,7 @@ if uploaded_file:
                     code = str(row["Login Code"]).strip().replace('.0','')
                     if len(code) < 4 and code.isdigit():
                         df_emp.at[i, '🔴 ACTION REQUIRED'] = "PIN too short"
-                        df_emp.at[i, '✨ SUGGESTED FIX'] = code.zfill(4) # Pad with zeros
+                        df_emp.at[i, '✨ SUGGESTED FIX'] = code.zfill(4)
                         quality_score -= 5
                 
                 bad = df_emp[df_emp['🔴 ACTION REQUIRED'] != ""]
@@ -265,12 +315,10 @@ if uploaded_file:
         </div>
         """, unsafe_allow_html=True)
         
-        # MAGIC BUTTON
         if quality_score < 100:
             st.markdown("<br>", unsafe_allow_html=True)
-            st.info("💡 **Tip:** We can auto-correct formatting, casing, and typos for you.")
+            st.info("💡 **Tip:** We can auto-correct Prices, Casing, and PINs.")
             
-            # Generate Auto-Fixed File
             fixed_file = generate_autofixed_file(uploaded_file, bad_data_tables)
             st.download_button(
                 "🪄 Download Auto-Corrected File",
@@ -283,21 +331,19 @@ if uploaded_file:
 
     with c2:
         if bad_data_tables:
-            st.warning(f"Found {sum([len(df) for df in bad_data_tables.values()])} rows requiring attention.")
+            st.warning(f"Found {sum([len(df) for df in bad_data_tables.values()])} rows that will FAIL on upload.")
             
             tabs = st.tabs(list(bad_data_tables.keys()))
             for i, (sheet, df) in enumerate(bad_data_tables.items()):
                 with tabs[i]:
-                    # REORDER COLUMNS FOR UI
-                    # Put Suggestion next to Action
                     cols = ['Row #', '🔴 ACTION REQUIRED', '✨ SUGGESTED FIX'] + [c for c in df.columns if c not in ['Row #', '🔴 ACTION REQUIRED', '✨ SUGGESTED FIX']]
                     
                     st.data_editor(
                         df[cols],
                         hide_index=True,
                         use_container_width=True,
-                        disabled=cols # Read-only view
+                        disabled=cols 
                     )
         else:
-            st.success("🎉 No Errors! Your file is perfect.")
+            st.success("🎉 Perfect! All Products have Menus, Categories, Prices, and Prep Locations.")
             st.balloons()
