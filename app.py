@@ -3,156 +3,165 @@ import pandas as pd
 import openpyxl
 import re
 import io
-import time
 
-# --- IMPORT RAPIDFUZZ (With fallback) ---
-try:
-    from rapidfuzz import process, fuzz
-    FUZZY_AVAILABLE = True
-except ImportError:
-    FUZZY_AVAILABLE = False
+# --- 1. CONFIGURATION ---
+st.set_page_config(page_title="Yoco Standardization Factory", page_icon="🏭", layout="wide")
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Yoco Data Doctor",
-    page_icon="🏥",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# --- 2. CSS STYLING ---
 st.markdown("""
 <style>
-    .stApp { background-color: #f8f9fa; }
-    .hero-box {
-        background: linear-gradient(90deg, #1cb5e0 0%, #000851 100%);
-        padding: 30px; border-radius: 15px; color: white; text-align: center; margin-bottom: 20px;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    .stApp { background-color: #f0f2f6; }
+    .header-box {
+        background: #101820; color: #FEE715; 
+        padding: 30px; border-radius: 10px; text-align: center; margin-bottom: 20px;
     }
-    .metric-card {
-        background-color: white; padding: 20px; border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
-        border: 1px solid #e9ecef;
+    .standard-card {
+        background: white; padding: 20px; border-radius: 8px; 
+        border-left: 5px solid #101820; box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
-    .metric-val { font-size: 32px; font-weight: bold; margin: 0; color: #2d3748; }
-    
-    /* Highlight Columns in Editor */
-    div[data-testid="stDataFrame"] table tbody tr td:nth-child(2) {
-        font-weight: bold; color: #e53e3e; background-color: #fff5f5; /* Action Required Red */
-    }
-    div[data-testid="stDataFrame"] table tbody tr td:nth-child(3) {
-        font-weight: bold; color: #38a169; background-color: #f0fff4; /* Suggestion Green */
-    }
+    .success-text { color: #2e7d32; font-weight: bold; }
+    .fail-text { color: #c62828; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. HELPER FUNCTIONS ---
+# --- 2. THE STANDARDIZATION LOGIC ENGINE ---
 
-def normalize_name(name):
-    if pd.isna(name): return ""
-    name = str(name).strip()
-    name = re.sub(r'(?i)\(RAW\)', '', name)
-    name = re.sub(r'(?i)\(MAN\)', '', name)
-    return name.strip()
+def clean_text(text):
+    """Enforce Title Case and remove extra spaces."""
+    if pd.isna(text): return ""
+    return str(text).strip().title()
 
-def get_clean_data(file, sheet_name, unique_col_identifier):
+def clean_price(price):
+    """Enforce float format (no R symbols)."""
+    if pd.isna(price): return None
+    clean = re.sub(r'[^0-9.]', '', str(price))
     try:
-        df_scan = pd.read_excel(file, sheet_name=sheet_name, header=None, nrows=50)
-        matching_rows = []
-        for i, row in df_scan.iterrows():
-            row_str = row.astype(str).str.replace(r'\s+', ' ', regex=True).str.strip()
-            if row_str.str.contains(unique_col_identifier, case=False, na=False).any():
-                matching_rows.append(i)
-        
-        if not matching_rows: return None, f"Header '{unique_col_identifier}' not found"
+        return float(clean)
+    except:
+        return None
 
-        header_row_idx = matching_rows[-1]
-        df = pd.read_excel(file, sheet_name=sheet_name, header=header_row_idx)
-        df.columns = df.columns.astype(str).str.strip()
-
-        # Remove Empty Rows / Examples
-        target_col = next((c for c in df.columns if unique_col_identifier.lower() in c.lower()), None)
-        if target_col:
-            df = df[df[target_col].notna()]
-            df = df[df[target_col].astype(str).str.strip() != ""]
-            df = df[df[target_col].astype(str).str.upper() != "EXAMPLE"]
-            df = df[df[target_col].astype(str).str.upper() != "EXAMPLES"]
-
-        offset = header_row_idx + 2 
-        df['Row #'] = df.index + offset
-        
-        df['🔴 ACTION REQUIRED'] = "" 
-        df['✨ SUGGESTED FIX'] = ""
-        
-        return df, None
-    except Exception as e: return None, str(e)
-
-# --- 4. AUTO-FIX ENGINE (Now Handles Categories!) ---
-def generate_autofixed_file(original_file, bad_data_tables):
-    wb = openpyxl.load_workbook(original_file)
+def split_hierarchy(text):
+    """
+    Standard: 'Menu/Category/Item' -> Returns (Menu, Category)
+    """
+    if pd.isna(text): return None, None
+    text = str(text)
     
-    for sheet_name, df_errors in bad_data_tables.items():
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
+    delimiters = ['/', '>', '-', '\\']
+    for d in delimiters:
+        if d in text:
+            parts = text.split(d)
+            # Logic: First part is usually Menu/Department, Last part is Category
+            menu_part = parts[0].strip().title()
+            cat_part = parts[-1].strip().title()
             
-            # 1. Map Columns (Scan rows 1-20 to find headers)
-            col_map = {}
-            for r in range(1, 20):
-                for c in range(1, ws.max_column + 1):
-                    val = ws.cell(row=r, column=c).value
-                    if val: col_map[str(val).strip()] = c
+            # Correction: If menu_part is just "Menu", genericize it
+            if menu_part.lower() == "menu": 
+                menu_part = "Food Menu" # Assumption, but better than "Menu"
+                
+            return menu_part, cat_part
             
-            # 2. Apply Fixes
-            for idx, row in df_errors.iterrows():
-                excel_row = row['Row #']
-                suggestion = row['✨ SUGGESTED FIX']
-                action = row['🔴 ACTION REQUIRED']
-                
-                if not suggestion or suggestion == "": continue
-                
-                target_col_idx = None
-                
-                # Intelligent Column Mapping
-                if "Ghost Item" in action:
-                    for k, v in col_map.items(): 
-                        if "RAW MATERIAL" in k.upper(): target_col_idx = v; break
-                elif "Price" in action:
-                    for k, v in col_map.items(): 
-                        if "Price" in k: target_col_idx = v; break
-                elif "PIN" in action:
-                    for k, v in col_map.items():
-                        if "Login" in k: target_col_idx = v; break
-                
-                # --- NEW: Casing Logic Mapping ---
-                elif "Title Case" in action or "Name" in action:
-                     if "Category" in action:
-                         for k, v in col_map.items(): 
-                            if "Category" in k: target_col_idx = v; break
-                     elif "Menu" in action:
-                         for k, v in col_map.items(): 
-                            if "Menu" in k and "Category" not in k: target_col_idx = v; break
-                     elif "Name" in action:
-                         for k, v in col_map.items(): 
-                            if "Product Name" in k: target_col_idx = v; break
+    return None, text.strip().title() # Return None for menu, Text for category
 
-                if target_col_idx:
-                    try:
-                        if str(suggestion).replace('.','',1).isdigit():
-                            ws.cell(row=int(excel_row), column=target_col_idx).value = float(suggestion)
-                        else:
-                            ws.cell(row=int(excel_row), column=target_col_idx).value = suggestion
-                    except: pass
+def infer_prep_location(category, menu):
+    """
+    Logic: Guess Kitchen vs Bar based on keywords.
+    """
+    text = (str(category) + " " + str(menu)).upper()
+    
+    bar_keywords = ["DRINK", "BEER", "WINE", "COCKTAIL", "COFFEE", "BEVERAGE", "SOFT", "SPIRIT", "CIDER"]
+    kitchen_keywords = ["FOOD", "MAIN", "STARTER", "DESSERT", "PIZZA", "BURGER", "SALAD", "SIDE", "MEAT"]
+    
+    if any(k in text for k in bar_keywords): return "Bar"
+    if any(k in text for k in kitchen_keywords): return "Kitchen"
+    return "Kitchen" # Default fallback
 
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+def infer_menu(category):
+    """
+    Logic: Guess Food vs Drinks based on Category.
+    """
+    text = str(category).upper()
+    bar_keywords = ["DRINK", "BEER", "WINE", "COCKTAIL", "COFFEE", "BEVERAGE"]
+    
+    if any(k in text for k in bar_keywords): return "Beverage Menu"
+    return "Food Menu"
 
-# --- 5. MAIN APP ---
+# --- 3. THE PROCESSOR ---
+
+def run_standardization_factory(df_prod):
+    """
+    Takes a raw Products DataFrame and forces it into the Standard.
+    Returns: A new, clean DataFrame and a log of changes.
+    """
+    clean_rows = []
+    logs = []
+
+    # Map columns flexibly
+    cols = df_prod.columns
+    c_name = next((c for c in cols if "Product Name" in c), None)
+    c_price = next((c for c in cols if "Selling Price" in c), None)
+    c_cat = next((c for c in cols if "Category" in c), None)
+    c_menu = next((c for c in cols if "Menu" in c and "Category" not in c), None)
+    c_prep = next((c for c in cols if "Preparation" in c or "Prep" in c), None)
+    
+    for idx, row in df_prod.iterrows():
+        # 1. Identity Check (Skip empty rows)
+        raw_name = row.get(c_name)
+        if pd.isna(raw_name) or str(raw_name).strip() == "": continue
+        if str(raw_name).upper() == "EXAMPLE": continue
+
+        # 2. Extract & Clean Basic Data
+        final_name = clean_text(raw_name)
+        final_price = clean_price(row.get(c_price))
+        
+        # 3. Handle Hierarchy (Menu/Category)
+        raw_cat = row.get(c_cat)
+        raw_menu = row.get(c_menu)
+        
+        final_menu = clean_text(raw_menu)
+        final_cat = clean_text(raw_cat)
+        
+        # LOGIC: Check if Category contains a path (e.g. Menu/Sushi)
+        inferred_menu, split_cat = split_hierarchy(raw_cat)
+        
+        if inferred_menu:
+            final_cat = split_cat
+            # Only override menu if it was empty or generic
+            if not final_menu or final_menu == "Menu":
+                final_menu = inferred_menu
+        
+        # LOGIC: If Menu is still missing, infer from Category
+        if not final_menu:
+            final_menu = infer_menu(final_cat)
+            
+        # 4. Handle Prep Location
+        final_prep = clean_text(row.get(c_prep))
+        if not final_prep:
+            final_prep = infer_prep_location(final_cat, final_menu)
+
+        # 5. Build Standardized Row
+        new_row = {
+            "Product Name": final_name,
+            "Selling Price": final_price if final_price is not None else 0,
+            "Menu": final_menu,
+            "Category": final_cat,
+            "Prep Location": final_prep,
+            "Status": "✅ Standardized"
+        }
+        
+        # Log Logic Changes
+        if final_menu != clean_text(raw_menu): logs.append(f"Row {idx+2}: Inferred Menu '{final_menu}'")
+        if final_prep != clean_text(row.get(c_prep)): logs.append(f"Row {idx+2}: Inferred Prep '{final_prep}'")
+        if "/" in str(raw_cat): logs.append(f"Row {idx+2}: Split Hierarchy '{raw_cat}'")
+
+        clean_rows.append(new_row)
+
+    return pd.DataFrame(clean_rows), logs
+
+# --- 4. APP UI ---
 st.markdown("""
-<div class="hero-box">
-    <h1>🏥 Yoco Data Doctor</h1>
-    <p>Ensures <b>Menus</b>, <b>Categories</b>, and <b>Prep Locations</b> are visible and formatted correctly.</p>
+<div class="header-box">
+    <h1>🏭 Yoco Standardization Factory</h1>
+    <p>Upload any messy Excel sheet. We will force it into the <b>Menu > Category > Product</b> standard.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -160,175 +169,63 @@ uploaded_file = st.file_uploader("", type=["xlsx"])
 
 if uploaded_file:
     try:
-        wb_temp = openpyxl.load_workbook(uploaded_file, read_only=True)
-        visible_sheets = [s.title for s in wb_temp.worksheets if s.sheet_state == 'visible']
-    except: visible_sheets = []
-
-    if not visible_sheets:
-        st.error("No visible sheets found.")
-        st.stop()
-
-    quality_score = 100
-    valid_ingredients = set()
-    bad_data_tables = {}
-    
-    with st.spinner("🏥 Examining your data..."):
+        # Load File
+        wb = openpyxl.load_workbook(uploaded_file, read_only=True)
+        visible_sheets = [s.title for s in wb.worksheets if s.sheet_state == 'visible']
         
-        # --- A. BUILD INGREDIENT LIST ---
-        if "Stock Items(RAW MATERIALS)" in visible_sheets:
-            df, _ = get_clean_data(uploaded_file, "Stock Items(RAW MATERIALS)", "RAW MATERIAL Product Name")
-            if df is not None:
-                for n in df["RAW MATERIAL Product Name"].dropna().astype(str): 
-                    valid_ingredients.add(normalize_name(n))
-
-        if "MANUFACTURED PRODUCTS" in visible_sheets:
-            df, _ = get_clean_data(uploaded_file, "MANUFACTURED PRODUCTS", "MANUFACTURED Product Name")
-            if df is not None:
-                for n in df["MANUFACTURED Product Name"].dropna().astype(str): 
-                    valid_ingredients.add(normalize_name(n))
-
-        # --- B. CHECK PRODUCTS (POS VISIBILITY & FORMATTING) ---
         if "Products(Finished Goods)" in visible_sheets:
-            df_prod, _ = get_clean_data(uploaded_file, "Products(Finished Goods)", "Product Name")
-            if df_prod is not None:
-                
-                # Find Columns
-                cols = df_prod.columns
-                col_price = next((c for c in cols if "Selling Price" in c), None)
-                col_menu = next((c for c in cols if "Menu" in c and "Category" not in c), None)
-                col_cat = next((c for c in cols if "Category" in c), None)
-                col_prep = next((c for c in cols if "Preparation" in c or "Prep" in c), None)
-                col_name = next((c for c in cols if "Product Name" in c), None)
-
-                for i, row in df_prod.iterrows():
-                    issues = []
-                    suggestion = "" # Holds the PRIMARY suggestion
-                    
-                    # 1. PRICE CHECK
-                    if col_price:
-                        price = row.get(col_price)
-                        if pd.isna(price) or str(price).strip() == "":
-                             issues.append("Missing Price")
-                        elif re.search(r'[a-zA-Z\s]', str(price)):
-                             issues.append("Bad Price Format")
-                             if not suggestion: suggestion = re.sub(r'[^0-9.]', '', str(price))
-
-                    # 2. MENU CHECK (Casing)
-                    if col_menu:
-                        val = row.get(col_menu)
-                        if pd.isna(val) or str(val).strip() == "":
-                            issues.append("Missing Menu")
-                        elif not str(val).istitle():
-                            issues.append("Menu needs Title Case")
-                            if not suggestion: suggestion = str(val).title()
-
-                    # 3. CATEGORY CHECK (Casing)
-                    if col_cat:
-                        val = row.get(col_cat)
-                        if pd.isna(val) or str(val).strip() == "":
-                            issues.append("Missing Category")
-                        elif not str(val).istitle():
-                            issues.append("Category needs Title Case")
-                            # Prioritize Category fix if no other suggestion exists
-                            if not suggestion: suggestion = str(val).title()
-
-                    # 4. PREP LOCATION
-                    if col_prep:
-                        val = row.get(col_prep)
-                        if pd.isna(val) or str(val).strip() == "":
-                            issues.append("Missing Prep Location")
-                    
-                    # 5. NAME CHECK
-                    if col_name:
-                         name = str(row.get(col_name))
-                         if name.islower():
-                             issues.append("Name is lowercase")
-                             if not suggestion: suggestion = name.title()
-
-                    if issues:
-                        df_prod.at[i, '🔴 ACTION REQUIRED'] = " & ".join(issues)
-                        if suggestion: df_prod.at[i, '✨ SUGGESTED FIX'] = suggestion
-                        quality_score -= 10
-                
-                bad = df_prod[df_prod['🔴 ACTION REQUIRED'] != ""]
-                if not bad.empty: bad_data_tables["Products"] = bad
-
-        # --- C. CHECK RECIPES ---
-        if "Products Recipes" in visible_sheets:
-            df_rec, _ = get_clean_data(uploaded_file, "Products Recipes", "RAW MATERIALS")
-            if df_rec is not None:
-                col_ing = next((c for c in df_rec.columns if "RAW MATERIAL" in c.upper() and "NAME" in c.upper()), None)
-                if col_ing:
-                    for i, row in df_rec.iterrows():
-                        ing = normalize_name(row[col_ing])
-                        if ing and ing not in valid_ingredients:
-                            sug = ""
-                            txt = f"Ghost Item: '{row[col_ing]}'"
-                            if FUZZY_AVAILABLE:
-                                match = process.extractOne(ing, valid_ingredients, scorer=fuzz.WRatio)
-                                if match and match[1] > 85:
-                                    sug = match[0]
-                                    txt += " (Typo?)"
-                            df_rec.at[i, '🔴 ACTION REQUIRED'] = txt
-                            df_rec.at[i, '✨ SUGGESTED FIX'] = sug
-                            quality_score -= 10
-                    bad = df_rec[df_rec['🔴 ACTION REQUIRED'] != ""]
-                    if not bad.empty: bad_data_tables["Recipes"] = bad
-
-        # --- D. CHECK EMPLOYEES ---
-        if "Employee List" in visible_sheets:
-            df_emp, _ = get_clean_data(uploaded_file, "Employee List", "Employee Name")
-            if df_emp is not None and "Login Code" in df_emp.columns:
-                for i, row in df_emp.iterrows():
-                    code = str(row["Login Code"]).strip().replace('.0','')
-                    if len(code) < 4 and code.isdigit():
-                        df_emp.at[i, '🔴 ACTION REQUIRED'] = "PIN too short"
-                        df_emp.at[i, '✨ SUGGESTED FIX'] = code.zfill(4)
-                        quality_score -= 5
-                bad = df_emp[df_emp['🔴 ACTION REQUIRED'] != ""]
-                if not bad.empty: bad_data_tables["Employees"] = bad
-
-    # --- 6. DASHBOARD ---
-    quality_score = max(0, int(quality_score))
-    
-    c1, c2 = st.columns([1,3])
-    with c1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-val" style="color: {'#38a169' if quality_score > 80 else '#e53e3e'}">{quality_score}%</div>
-            <div class="metric-lbl">Data Health</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if quality_score < 100:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.info("💡 **Tip:** Click below to apply all the green suggestions automatically.")
+            # Load Data (Using the Last Header Logic from before)
+            df_scan = pd.read_excel(uploaded_file, sheet_name="Products(Finished Goods)", header=None, nrows=50)
+            header_row = 0
+            for i, r in df_scan.iterrows():
+                if r.astype(str).str.contains("Product Name", case=False).any(): header_row = i
             
-            fixed_file = generate_autofixed_file(uploaded_file, bad_data_tables)
-            st.download_button(
-                "🪄 Download Auto-Corrected File",
-                data=fixed_file,
-                file_name="Yoco_AutoFixed.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True
-            )
-
-    with c2:
-        if bad_data_tables:
-            st.warning(f"Found {sum([len(df) for df in bad_data_tables.values()])} issues preventing upload.")
+            df_raw = pd.read_excel(uploaded_file, sheet_name="Products(Finished Goods)", header=header_row)
             
-            tabs = st.tabs(list(bad_data_tables.keys()))
-            for i, (sheet, df) in enumerate(bad_data_tables.items()):
-                with tabs[i]:
-                    cols = ['Row #', '🔴 ACTION REQUIRED', '✨ SUGGESTED FIX'] + [c for c in df.columns if c not in ['Row #', '🔴 ACTION REQUIRED', '✨ SUGGESTED FIX']]
-                    
-                    st.data_editor(
-                        df[cols],
-                        hide_index=True,
-                        use_container_width=True,
-                        disabled=cols 
-                    )
+            # --- RUN FACTORY ---
+            st.write("⚙️ **Running Logic Engine...**")
+            df_standard, logs = run_standardization_factory(df_raw)
+            
+            # --- RESULTS ---
+            c1, c2 = st.columns([2, 1])
+            
+            with c1:
+                st.subheader("✅ The Standardized Output")
+                st.markdown("This data is now strict, clean, and ready for import.")
+                st.dataframe(df_standard, use_container_width=True)
+                
+                # Download Button
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_standard.to_excel(writer, index=False, sheet_name='Cleaned_Products')
+                output.seek(0)
+                
+                st.download_button(
+                    "📥 Download Standardized Excel",
+                    data=output,
+                    file_name="Yoco_Standardized_Menu.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
+
+            with c2:
+                st.subheader("🤖 Logic Applied")
+                st.markdown(f"**Total Items Processed:** {len(df_standard)}")
+                st.markdown(f"**Automated Fixes:** {len(logs)}")
+                
+                with st.expander("View Logic Logs", expanded=True):
+                    for log in logs:
+                        st.caption(log)
+                        
+                st.info("""
+                **Standards Enforced:**
+                1. **Hierarchy:** `Menu/Sushi` → Menu: Food, Cat: Sushi.
+                2. **Prep:** `Beer` → Bar. `Burger` → Kitchen.
+                3. **Casing:** All text converted to Title Case.
+                4. **Prices:** Currency symbols removed.
+                """)
         else:
-            st.success("🎉 Perfect! All products have correct Menus, Categories, and Prices.")
-            st.balloons()
+            st.error("Could not find 'Products(Finished Goods)' tab.")
+            
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
