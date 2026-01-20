@@ -6,33 +6,43 @@ import time
 
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Yoco Onboarding Repair Station",
+    page_title="Yoco Repair & Logic Tool",
     page_icon="🛠️",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# --- 2. CSS FOR EDITOR ---
+# --- 2. CUSTOM CSS ---
 st.markdown("""
 <style>
-    .stApp { background-color: #f4f6f9; }
+    .stApp { background-color: #f8f9fa; }
+    
+    /* Metrics */
     .metric-card {
         background-color: white; padding: 15px; border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: center;
+        border: 1px solid #e9ecef;
     }
-    .metric-value { font-size: 28px; font-weight: bold; margin: 0; }
-    .metric-label { font-size: 12px; color: #888; text-transform: uppercase; }
+    .metric-val { font-size: 24px; font-weight: bold; margin: 0; }
+    .metric-lbl { font-size: 12px; color: #6c757d; text-transform: uppercase; }
+
+    /* Logic/Suggestion Box */
+    .suggestion-box {
+        background-color: #eef2ff; 
+        border-left: 5px solid #4f46e5;
+        padding: 15px;
+        margin-bottom: 10px;
+        border-radius: 4px;
+    }
     
-    /* Highlight the Action Column */
+    /* Highlight Action Column in Editor */
     div[data-testid="stDataFrame"] table tbody tr td:first-child {
-        font-weight: bold;
-        color: #d63384;
-        background-color: #fff0f6;
+        font-weight: bold; color: #d63384; background-color: #fff0f6;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. LOGIC & HELPERS ---
+# --- 3. HELPER FUNCTIONS ---
 
 def normalize_name(name):
     if pd.isna(name): return ""
@@ -64,7 +74,7 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
         df = pd.read_excel(file, sheet_name=sheet_name, header=header_row_idx)
         df.columns = df.columns.astype(str).str.strip()
 
-        # Identity Check & Setup Validation Column
+        # Identity Check & Setup
         target_col = next((c for c in df.columns if unique_col_identifier.lower() in c.lower()), None)
         if target_col:
             df = df[df[target_col].notna()]
@@ -74,10 +84,10 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
         offset = header_row_idx + 2 
         df['Row #'] = df.index + offset
         
-        # Init Error Column
+        # Init Error Column (Empty by default)
         df['🔴 ACTION REQUIRED'] = "" 
         
-        # Move Key Columns to Front
+        # Reorder columns
         cols = ['Row #', '🔴 ACTION REQUIRED'] + [c for c in df.columns if c not in ['Row #', '🔴 ACTION REQUIRED']]
         df = df[cols]
         
@@ -85,9 +95,96 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
     except Exception as e:
         return None, str(e)
 
-# --- 4. MAIN APP ---
-st.title("🛠️ Yoco Data Repair Station")
-st.markdown("Upload your file. This tool will extract **only the rows that need fixing** so you can see the full context.")
+# --- 4. NEW: LOGIC ADVISORY ENGINE ---
+def generate_suggestions(df_prod, df_mod):
+    suggestions = []
+    
+    # --- A. VARIANT DETECTOR ---
+    # Looks for items like "Latte - Small", "Latte - Large"
+    if df_prod is not None and not df_prod.empty:
+        # Extract Product Names
+        col_name = next((c for c in df_prod.columns if "Product Name" in c), None)
+        if col_name:
+            names = df_prod[col_name].astype(str).tolist()
+            # Find base names before a hyphen (e.g., "Latte" from "Latte - Small")
+            base_names = [n.split('-')[0].strip() for n in names if '-' in n]
+            
+            # Count occurrences
+            from collections import Counter
+            counts = Counter(base_names)
+            
+            # If "Latte" appears 3+ times with hyphens, suggest variants
+            for base, count in counts.items():
+                if count >= 2:
+                    suggestions.append({
+                        "Type": "Structure",
+                        "Title": "Possible Variant Group",
+                        "Message": f"You have {count} items starting with **'{base}'** (e.g., {base} - Small).",
+                        "Advice": "Consider grouping these as a single Product with **Variants** (Small, Medium, Large) to clean up your menu."
+                    })
+
+    # --- B. MODIFIER LOGIC ---
+    if df_mod is not None and not df_mod.empty:
+        col_grp = next((c for c in df_mod.columns if "Modifier Group Name" in c), None)
+        col_opt = next((c for c in df_mod.columns if "Options" in c), None)
+        
+        if col_grp:
+            # Check for "Size" in modifiers
+            size_keywords = ["SIZE", "VOLUME", "WEIGHT"]
+            option_keywords = ["SMALL", "MEDIUM", "LARGE", "ML", "KG"]
+            
+            for index, row in df_mod.iterrows():
+                grp = str(row[col_grp]).upper()
+                opt = str(row[col_opt]).upper() if col_opt else ""
+                
+                if any(k in grp for k in size_keywords) or any(k in opt for k in option_keywords):
+                    suggestions.append({
+                        "Type": "Logic",
+                        "Title": "Sizes as Modifiers",
+                        "Message": f"Modifier Group **'{row[col_grp]}'** looks like it controls sizing.",
+                        "Advice": "Yoco Best Practice: Use **Variants** for sizes (so they track stock differently). Use Modifiers for instructions (e.g. No Onion)."
+                    })
+                    break # Only report once per group
+
+    # --- C. CASING CHECK ---
+    if df_prod is not None:
+        col_name = next((c for c in df_prod.columns if "Product Name" in c), None)
+        if col_name:
+            lowercase_count = df_prod[col_name].astype(str).str.islower().sum()
+            if lowercase_count > 3:
+                 suggestions.append({
+                        "Type": "Formatting",
+                        "Title": "Lowercase Names Detected",
+                        "Message": f"Found {lowercase_count} products using all lowercase letters (e.g. 'burger').",
+                        "Advice": "Use **Title Case** (e.g. 'Burger') for better receipts."
+                    })
+
+    # --- D. PROFITABILITY (Negative Margins) ---
+    if df_prod is not None and "Selling Price (incl vat)" in df_prod.columns:
+        col_cost = next((c for c in df_prod.columns if "Cost Price" in c), None)
+        col_sell = "Selling Price (incl vat)"
+        if col_cost:
+            neg_margins = 0
+            for index, row in df_prod.iterrows():
+                try:
+                    s = float(row[col_sell])
+                    c = float(row[col_cost])
+                    if c > s: neg_margins += 1
+                except: pass
+            
+            if neg_margins > 0:
+                 suggestions.append({
+                        "Type": "Profit",
+                        "Title": "Negative Margins",
+                        "Message": f"Found {neg_margins} items where Cost Price > Selling Price.",
+                        "Advice": "Check your Cost Price column. You might be losing money on every sale."
+                    })
+
+    return suggestions
+
+# --- 5. MAIN APP ---
+st.title("🛠️ Yoco Data Repair & Advisory")
+st.markdown("Automated cleaning, error detection, and restaurant logic suggestions.")
 
 uploaded_file = st.file_uploader("", type=["xlsx"])
 
@@ -103,32 +200,27 @@ if uploaded_file:
     valid_ingredients_set = set()
     PENALTY_CRITICAL = 10
     
-    # Store "Bad DataFrames" to display editors later
+    # Store DataFrames
     bad_data_tables = {} 
+    df_prod_global = None
+    df_mod_global = None
 
-    # --- PHASE 1: STOCK (Source of Truth) ---
+    # --- PHASE 1: STOCK ---
     if "Stock Items(RAW MATERIALS)" in visible_sheets:
         df_stock, err = get_clean_data(uploaded_file, "Stock Items(RAW MATERIALS)", "RAW MATERIAL Product Name")
         if df_stock is not None:
-            # Build Source of Truth
             for name in df_stock["RAW MATERIAL Product Name"].dropna().astype(str):
                 valid_ingredients_set.add(normalize_name(name))
             
-            # Validate Rows
             if "Cost Price" in df_stock.columns:
                 for idx, row in df_stock.iterrows():
-                    issues = []
-                    if pd.isna(row["Cost Price"]): issues.append("Missing Cost Price")
-                    
-                    if issues:
-                        df_stock.at[idx, '🔴 ACTION REQUIRED'] = " & ".join(issues)
+                    if pd.isna(row["Cost Price"]):
+                        df_stock.at[idx, '🔴 ACTION REQUIRED'] = "Missing Cost Price"
                         quality_score -= PENALTY_CRITICAL
                         total_errors += 1
             
-            # Filter Bad Rows
-            bad_rows = df_stock[df_stock['🔴 ACTION REQUIRED'] != ""]
-            if not bad_rows.empty:
-                bad_data_tables["Stock Items"] = bad_rows
+            bad = df_stock[df_stock['🔴 ACTION REQUIRED'] != ""]
+            if not bad.empty: bad_data_tables["Stock"] = bad
 
     # --- PHASE 2: MANUFACTURED ---
     if "MANUFACTURED PRODUCTS" in visible_sheets:
@@ -137,132 +229,99 @@ if uploaded_file:
             for name in df_man["MANUFACTURED Product Name"].dropna().astype(str):
                 valid_ingredients_set.add(normalize_name(name))
 
-    # --- PHASE 3: PRODUCTS (Finished Goods) ---
+    # --- PHASE 3: PRODUCTS ---
     if "Products(Finished Goods)" in visible_sheets:
         df_prod, err = get_clean_data(uploaded_file, "Products(Finished Goods)", "Product Name")
+        df_prod_global = df_prod # SAVE FOR LOGIC CHECK
+        
         if df_prod is not None:
             required = ["Selling Price (incl vat)", "Menu", "Menu Category", "Preparation Locations"]
-            
             for idx, row in df_prod.iterrows():
                 issues = []
-                # Check Missing Fields
                 for col in required:
                     if col in df_prod.columns:
                         if pd.isna(row[col]) or str(row[col]).strip() == "":
                             issues.append(f"Missing {col}")
-                
-                # Check Logic (Negative Margin)
-                if "Selling Price (incl vat)" in df_prod.columns and "Cost Price" in df_prod.columns:
-                    try:
-                        sell = float(row["Selling Price (incl vat)"])
-                        cost = float(row["Cost Price"]) if pd.notna(row["Cost Price"]) else 0
-                        if sell > 0 and cost > sell:
-                            issues.append(f"Negative Margin (Cost R{cost} > Sell R{sell})")
-                    except: pass
-
                 if issues:
                     df_prod.at[idx, '🔴 ACTION REQUIRED'] = " & ".join(issues)
                     quality_score -= PENALTY_CRITICAL
                     total_errors += 1
             
-            bad_rows = df_prod[df_prod['🔴 ACTION REQUIRED'] != ""]
-            if not bad_rows.empty:
-                bad_data_tables["Products"] = bad_rows
+            bad = df_prod[df_prod['🔴 ACTION REQUIRED'] != ""]
+            if not bad.empty: bad_data_tables["Products"] = bad
 
     # --- PHASE 4: RECIPES ---
     if "Products Recipes" in visible_sheets:
         df_rec, err = get_clean_data(uploaded_file, "Products Recipes", "RAW MATERIALS")
         col_ing = "RAW MATERIALS / MANUFACTURED PRODUCT NAME"
-        
         if df_rec is not None:
             if col_ing not in df_rec.columns:
-                # Try finding fuzzy match
                 match = [c for c in df_rec.columns if "RAW MATERIAL" in c.upper() and "NAME" in c.upper()]
                 if match: col_ing = match[0]
 
             if col_ing in df_rec.columns:
                 for idx, row in df_rec.iterrows():
-                    issues = []
                     ing = normalize_name(row[col_ing])
                     if ing and ing not in valid_ingredients_set:
-                        issues.append(f"Ghost Item: '{row[col_ing]}' (Not in Stock)")
-                    
-                    if issues:
-                        df_rec.at[idx, '🔴 ACTION REQUIRED'] = " & ".join(issues)
-                        quality_score -= PENALTY_CRITICAL
-                        total_errors += 1
+                         df_rec.at[idx, '🔴 ACTION REQUIRED'] = f"Ghost Item: '{row[col_ing]}'"
+                         quality_score -= PENALTY_CRITICAL
+                         total_errors += 1
             
-                bad_rows = df_rec[df_rec['🔴 ACTION REQUIRED'] != ""]
-                if not bad_rows.empty:
-                    bad_data_tables["Recipes"] = bad_rows
+            bad = df_rec[df_rec['🔴 ACTION REQUIRED'] != ""]
+            if not bad.empty: bad_data_tables["Recipes"] = bad
 
-    # --- PHASE 5: EMPLOYEES ---
-    if "Employee List" in visible_sheets:
-        df_emp, err = get_clean_data(uploaded_file, "Employee List", "Employee Name")
-        if df_emp is not None and "Login Code" in df_emp.columns:
-            for idx, row in df_emp.iterrows():
-                issues = []
-                code = str(row["Login Code"]).strip().replace('.0','')
-                if not code.isdigit() or len(code) < 4:
-                    issues.append(f"Invalid PIN '{code}'")
-                
-                if issues:
-                    df_emp.at[idx, '🔴 ACTION REQUIRED'] = " & ".join(issues)
-                    quality_score -= PENALTY_CRITICAL
-                    total_errors += 1
-            
-            bad_rows = df_emp[df_emp['🔴 ACTION REQUIRED'] != ""]
-            if not bad_rows.empty:
-                bad_data_tables["Employees"] = bad_rows
+    # --- PHASE 5: MODIFIERS (For Logic) ---
+    if "Modifers" in visible_sheets:
+        df_mod_global, err = get_clean_data(uploaded_file, "Modifers", "Modifier Group Name")
+    elif "Modifiers" in visible_sheets:
+        df_mod_global, err = get_clean_data(uploaded_file, "Modifiers", "Modifier Group Name")
+
+    # ================= LOGIC ENGINE =================
+    suggestions = generate_suggestions(df_prod_global, df_mod_global)
 
     # ================= UI DISPLAY =================
-    
-    # 1. METRICS
     quality_score = max(0, int(quality_score))
+    
     c1, c2, c3 = st.columns(3)
-    c1.metric("Data Quality", f"{quality_score}%", delta="Perfect" if quality_score==100 else "-Issues")
-    c2.metric("Rows to Fix", total_errors, delta_color="inverse")
-    c3.metric("Clean Rows", "Hidden")
+    c1.metric("Data Quality", f"{quality_score}%")
+    c2.metric("Critical Errors", total_errors, delta_color="inverse")
+    c3.metric("Suggestions", len(suggestions), delta_color="off")
 
-    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # TABS
+    tab1, tab2 = st.tabs(["🔴 Critical Repair Station", "💡 Advisory & Suggestions"])
 
-    # 2. INTERACTIVE EDITORS
-    if bad_data_tables:
-        st.warning("### 📝 Interactive Repair Station")
-        st.markdown("Below are **ONLY** the rows that have errors. Use this view to find the row in your Excel file, or verify the Headers.")
-        
-        # Create tabs for each sheet that has errors
-        sheet_tabs = st.tabs(list(bad_data_tables.keys()))
-        
-        for i, sheet_name in enumerate(bad_data_tables.keys()):
-            with sheet_tabs[i]:
-                df_show = bad_data_tables[sheet_name]
-                
-                st.caption(f"Found {len(df_show)} rows needing attention in '{sheet_name}'.")
-                
-                # THE EDITOR
-                # We disable 'Row #' and 'ACTION' from editing so user focuses on data
-                edited_df = st.data_editor(
-                    df_show,
-                    use_container_width=True,
-                    num_rows="fixed",
-                    disabled=["Row #", "🔴 ACTION REQUIRED"],
-                    hide_index=True
-                )
-                
-                # Download Button for this specific filtered list
-                csv = df_show.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    f"📥 Download '{sheet_name}' Fix List",
-                    csv,
-                    f"fix_list_{sheet_name}.csv",
-                    "text/csv"
-                )
+    # TAB 1: INTERACTIVE REPAIR
+    with tab1:
+        if bad_data_tables:
+            st.warning("The following rows prevent a successful upload. Use the 'Row #' to find and fix them in Excel.")
+            
+            for sheet, df_bad in bad_data_tables.items():
+                with st.expander(f"📍 {sheet} ({len(df_bad)} errors)", expanded=True):
+                    st.data_editor(
+                        df_bad,
+                        hide_index=True,
+                        disabled=["Row #", "🔴 ACTION REQUIRED"],
+                        use_container_width=True
+                    )
+        else:
+            st.success("🎉 No Critical Errors! Your data is valid.")
 
-    else:
-        st.balloons()
-        st.success("## 🎉 Amazing! No errors found.")
-        st.markdown("Your file passed all validation checks. You are ready to upload to Yoco.")
+    # TAB 2: ADVISORY (THE MISSING PIECE)
+    with tab2:
+        if suggestions:
+            st.markdown("These suggestions help improve your restaurant's operations and reporting.")
+            for s in suggestions:
+                st.markdown(f"""
+                <div class="suggestion-box">
+                    <strong>{s['Type']}</strong>: {s['Title']}<br>
+                    {s['Message']}<br>
+                    <em>👉 {s['Advice']}</em>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("✅ No suggestions. Your menu structure and pricing look clean.")
 
 else:
     st.info("Waiting for file...")
