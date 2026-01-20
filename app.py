@@ -21,7 +21,7 @@ st.markdown("""
 def normalize_name(name):
     """
     Removes (RAW), (MAN), and extra spaces to allow cross-matching.
-    Example: "(RAW) Tomatoes" becomes "Tomatoes"
+    Example: "(MAN) Pizza Sauce" becomes "Pizza Sauce"
     """
     if pd.isna(name):
         return ""
@@ -93,10 +93,10 @@ def get_clean_data(file, sheet_name, unique_col_identifier):
 # --- MAIN APP ---
 st.title("🛡️ Yoco Sheet Verifier")
 st.markdown("""
-**Logic:**
-1. Ignores Hidden Sheets.
-2. Skips Examples (Reads below 2nd header).
-3. **Smart Matching:** Ignores `(RAW)` and `(MAN)` prefixes when checking recipes.
+**Verification Logic:**
+1. **Raw Materials** + **Manufactured Products** = Valid Ingredients.
+2. Prefixes like `(RAW)` and `(MAN)` are ignored during matching.
+3. Examples and Hidden Sheets are ignored.
 """)
 
 uploaded_file = st.file_uploader("", type=["xlsx"])
@@ -112,14 +112,14 @@ if uploaded_file:
     quality_score = 100
     error_log = []
     
-    # We store the "Cleaned" stock names here
-    normalized_stock_set = set()
+    # MASTER INGREDIENT LIST (Stock + Manufactured)
+    valid_ingredients_set = set()
     
     PENALTY_CRITICAL = 10
     PENALTY_MINOR = 1
 
     # ==========================================
-    # CHECK 1: STOCK ITEMS
+    # CHECK 1: STOCK ITEMS (Raw Materials)
     # ==========================================
     if "Stock Items(RAW MATERIALS)" in visible_sheets:
         df_stock, err = get_clean_data(uploaded_file, "Stock Items(RAW MATERIALS)", "RAW MATERIAL Product Name")
@@ -136,10 +136,10 @@ if uploaded_file:
                     "Fix": "Stock sheet is empty (Examples ignored)."
                 })
             else:
-                # --- BUILD NORMALIZED STOCK LIST ---
-                # We strip (RAW) and (MAN) from the Source of Truth
+                # Add normalized names to Master List
                 raw_names = df_stock["RAW MATERIAL Product Name"].dropna().astype(str)
-                normalized_stock_set = set([normalize_name(x) for x in raw_names])
+                for name in raw_names:
+                    valid_ingredients_set.add(normalize_name(name))
 
                 if "Cost Price" in df_stock.columns:
                     for _, row in df_stock.iterrows():
@@ -156,41 +156,22 @@ if uploaded_file:
                             })
 
     # ==========================================
-    # CHECK 2: EMPLOYEES
+    # CHECK 2: MANUFACTURED PRODUCTS (New Logic)
     # ==========================================
-    if "Employee List" in visible_sheets:
-        df_emp, err = get_clean_data(uploaded_file, "Employee List", "Employee Name")
+    if "MANUFACTURED PRODUCTS" in visible_sheets:
+        df_man, err = get_clean_data(uploaded_file, "MANUFACTURED PRODUCTS", "MANUFACTURED Product Name")
         
-        if df_emp is not None:
-            if df_emp.empty:
-                # Assuming employees are required
-                quality_score -= 10
-                error_log.append({
-                    "Severity": "Warning",
-                    "Sheet": "Employee List",
-                    "Row": "-",
-                    "Column": "All",
-                    "Issue": "No Employees Found",
-                    "Fix": "Please add employees."
-                })
-            elif "Login Code" in df_emp.columns:
-                for _, row in df_emp.iterrows():
-                    code = str(row["Login Code"]).strip()
-                    if code.endswith(".0"): code = code[:-2]
-                    
-                    if not code.isdigit():
-                        quality_score -= PENALTY_MINOR
-                        error_log.append({
-                            "Severity": "Warning",
-                            "Sheet": "Employee List",
-                            "Row": row['__excel_row__'],
-                            "Column": "Login Code",
-                            "Issue": f"Invalid PIN '{code}'",
-                            "Fix": "Numbers only"
-                        })
+        if df_man is not None and not df_man.empty:
+            # Add normalized names to Master List
+            # Note: Matches header "MANUFACTURED Product Name"
+            man_names = df_man["MANUFACTURED Product Name"].dropna().astype(str)
+            for name in man_names:
+                valid_ingredients_set.add(normalize_name(name))
+            
+            st.toast(f"ℹ️ Loaded {len(man_names)} Manufactured Items into Ingredient List")
 
     # ==========================================
-    # CHECK 3: PRODUCTS
+    # CHECK 3: PRODUCTS (Finished Goods)
     # ==========================================
     if "Products(Finished Goods)" in visible_sheets:
         df_prod, err = get_clean_data(uploaded_file, "Products(Finished Goods)", "Product Name")
@@ -231,7 +212,7 @@ if uploaded_file:
                         })
 
     # ==========================================
-    # CHECK 4: RECIPES (With Normalization)
+    # CHECK 4: RECIPES (The Full Check)
     # ==========================================
     if "Products Recipes" in visible_sheets:
         df_rec, err = get_clean_data(uploaded_file, "Products Recipes", "RAW MATERIALS")
@@ -240,8 +221,7 @@ if uploaded_file:
         
         if df_rec is not None:
             if df_rec.empty:
-                # Only warn if stock exists but recipes don't
-                if normalized_stock_set:
+                if valid_ingredients_set:
                      quality_score -= 5
                      error_log.append({
                         "Severity": "Info",
@@ -257,16 +237,16 @@ if uploaded_file:
                     candidates = [c for c in df_rec.columns if "RAW MATERIAL" in c.upper() and "NAME" in c.upper()]
                     if candidates: col_ing_name = candidates[0]
 
-                if col_ing_name in df_rec.columns and normalized_stock_set:
+                if col_ing_name in df_rec.columns and valid_ingredients_set:
                     for _, row in df_rec.iterrows():
                         original_ing_name = str(row[col_ing_name]).strip()
                         if original_ing_name == "nan" or original_ing_name == "": continue
                         
                         # --- NORMALIZE BEFORE CHECKING ---
-                        # Clean the recipe ingredient name (remove RAW/MAN)
                         clean_ing_name = normalize_name(original_ing_name)
                         
-                        if clean_ing_name not in normalized_stock_set:
+                        # CHECK BOTH STOCK AND MANUFACTURED LISTS
+                        if clean_ing_name not in valid_ingredients_set:
                             quality_score -= PENALTY_CRITICAL
                             error_log.append({
                                 "Severity": "Critical",
@@ -274,8 +254,29 @@ if uploaded_file:
                                 "Row": row['__excel_row__'],
                                 "Column": "Ingredient",
                                 "Issue": f"Ghost Item: '{original_ing_name}'",
-                                "Fix": "Spelling must match Stock (ignoring RAW/MAN prefixes)"
+                                "Fix": "Item not found in Stock OR Manufactured Products"
                             })
+
+    # ==========================================
+    # CHECK 5: EMPLOYEES
+    # ==========================================
+    if "Employee List" in visible_sheets:
+        df_emp, err = get_clean_data(uploaded_file, "Employee List", "Employee Name")
+        if df_emp is not None and not df_emp.empty:
+             if "Login Code" in df_emp.columns:
+                for _, row in df_emp.iterrows():
+                    code = str(row["Login Code"]).strip()
+                    if code.endswith(".0"): code = code[:-2]
+                    if not code.isdigit():
+                        quality_score -= PENALTY_MINOR
+                        error_log.append({
+                            "Severity": "Warning",
+                            "Sheet": "Employee List",
+                            "Row": row['__excel_row__'],
+                            "Column": "Login Code",
+                            "Issue": f"Invalid PIN '{code}'",
+                            "Fix": "Numbers only"
+                        })
 
     # ==========================================
     # OUTPUT
